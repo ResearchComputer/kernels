@@ -153,10 +153,16 @@ def main():
         print(f"correctness (all ranks): {'PASS' if flag.item() else 'FAIL'}", flush=True)
 
     # ---- latency: flat vs hierarchical ----
+    itemsize = torch.empty((), dtype=dtype).element_size()
     if rank == 0:
-        print(f"\n{'bs':>4} {'flat_ms':>10} {'hier_ms':>10} {'speedup':>8}", flush=True)
+        print(
+            f"\n{'bs':>5} {'MB':>8} {'flat_ms':>10} {'hier_ms':>10} "
+            f"{'flatGB/s':>9} {'hierGB/s':>9} {'speedup':>8}",
+            flush=True,
+        )
     for bs in args.sizes:
         x = (torch.randn(bs, args.hidden, device=device) * 0.1).to(dtype)
+        mb = bs * args.hidden * itemsize / 1e6
         flat_ms = _bench(
             lambda x=x: flat_all_reduce(x, group=None), device, args.iters, args.warmup
         )
@@ -167,8 +173,12 @@ def main():
             args.warmup,
         )
         if rank == 0:
+            # effective all-reduce bus bandwidth: 2*(n-1)/n * bytes / time
+            busf = 2 * (world - 1) / world * (mb / 1e3) / (flat_ms / 1e3)
+            bush = 2 * (world - 1) / world * (mb / 1e3) / (hier_ms / 1e3)
             print(
-                f"{bs:>4} {flat_ms:>10.4f} {hier_ms:>10.4f} {flat_ms / hier_ms:>7.2f}x",
+                f"{bs:>5} {mb:>8.2f} {flat_ms:>10.4f} {hier_ms:>10.4f} "
+                f"{busf:>9.1f} {bush:>9.1f} {flat_ms / hier_ms:>7.2f}x",
                 flush=True,
             )
 

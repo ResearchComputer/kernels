@@ -47,20 +47,76 @@ This is consistent with the issue's premise: the win exists only when the
 per-launch cost is amortized, i.e. **under HIP-graph decode capture** (the serve's
 regime). It is not visible in an eager microbenchmark.
 
-## Open: graph-captured measurement
+## Graph-captured measurement — cracked
 
-The decisive decode-regime number needs the collective sequence captured in a
-HIP graph. Capturing the **networked RCCL/OFI-CXI** collectives is blocked on this
-stack (PyTorch 2.11+rocm7.2, RCCL 2.27.7, from-source aws-ofi-rccl):
+Capturing the **networked RCCL/OFI-CXI** collectives in a HIP graph was blocked by
+*two independent* failures on this stack (PyTorch 2.11+rocm7.2, RCCL 2.27.7,
+from-source aws-ofi-rccl). Both are now solved:
 
-- The PG watchdog calls `hipEventQuery` on the capturing stream → `operation not
-  permitted when stream is capturing` (abort).
-- Disabling the watchdog (`TORCH_NCCL_ASYNC_ERROR_HANDLING=0`) then surfaces an
-  OFI memory-registration `invalid device pointer`.
+1. **OFI memory-registration** `invalid device pointer` mid-capture. Fixed by
+   making CXI MR registration capture-safe: `FI_CXI_OPTIMIZED_MRS=0` (or the
+   libfabric MR cache via `FI_MR_CACHE_MONITOR=memhooks` +
+   `NCCL_OFI_MR_CACHE_DISABLE=0`).
+2. **PG watchdog** calling `hipEventQuery` on the capturing stream → `operation
+   not permitted when stream is capturing`. *Not* env-tunable here
+   (`TORCH_NCCL_ASYNC_ERROR_HANDLING=0` does not stop the thread). Fixed by
+   driving the collectives through a **watchdog-free raw RCCL communicator**
+   (`benchmarks/pynccl_lite.py`, ctypes over `librccl.so`) — the same approach
+   vLLM/SGLang use. The unique-id handshake rides the existing torch.distributed
+   store; no collective ever goes through the watchdog'd PG.
 
-So the graph-captured win is best measured in the **serve's own HIP-graph capture
-path** (tokenspeed-amd), which captures the whole decode step including collectives
-and handles the watchdog. Tracked as the remaining work on #12.
+`benchmarks/bench_capture_pynccl.py` (driver: `slurm/bench_capture_beverin.sbatch`)
+captures both schedules and replays them. Correctness re-validated through the raw
+comm (flat sum == world, hier == flat) before timing.
+
+## Captured latency finding (2-node MI300A, HIP graph, job 380930)
+
+```
+   bs       MB    flat_ms    hier_ms  speedup
+    1    0.014     0.0682     0.0939    0.73x
+    2    0.029     0.0776     0.1030    0.75x
+    4    0.057     0.1123     0.1012    1.11x
+    8    0.115     0.1091     0.1079    1.01x
+   16    0.229     0.1126     0.1177    0.96x
+   64    0.918     0.1372     0.1383    0.99x
+  256    3.670     0.1874     0.1759    1.07x
+ 1024   14.680     0.3291     0.3719    0.88x
+ 4096   58.720     0.8714     1.1926    0.73x
+```
+
+**Capture does what we predicted — it amortizes the per-launch penalty.** The
+decode (bs=1) flat-vs-hier ratio improved from eager **0.45×** to captured
+**0.73×**: with the 3 collectives' launch overhead removed from the graph, most of
+the gap closes. That was the technical claim the deep-dive set out to prove, and it
+holds.
+
+**But hierarchical still does not beat flat — at any size, in either mode.** The
+crossover never arrives. The reason is the baseline: on this stack RCCL's *flat*
+all-reduce is **already topology-aware** — it discovers the 4 CXI NICs, builds NIC
+groups, and runs an internally hierarchical schedule (`Selected provider is cxi …
+found 4 nics`, NIC groups 0–3, `SENDRECV`). Our hand-written
+`reduce_scatter`(xGMI) → `all_reduce`(CXI, ¼ payload) → `all_gather`(xGMI) is doing
+manually what RCCL already does inside one launch, so:
+
+- **Decode (≤14 KiB, bs≤2):** latency-bound. Even captured, 3 serial dependent
+  graph nodes (each with its own intra-/cross-node sync) cost more than flat's one
+  → **0.73–0.75×**.
+- **Mid (bs 4–256, 57 KiB–3.7 MB):** roughly even, occasionally +7–11% — within
+  run-to-run noise, no robust win.
+- **Bandwidth (bs≥1024, ≥14.7 MB):** the extra xGMI `reduce_scatter`+`all_gather`
+  passes are pure overhead on top of an already-NIC-saturating flat collective →
+  **0.73× at 58.7 MB.** No crossover.
+
+**Conclusion for #12.** The fused-epilogue + hierarchical schedule is *correct* on
+real 2-node CXI (acceptance #1 met), and the graph-capture blocker is fully cracked
+and documented. The *performance* premise — that a hand-rolled hierarchical
+decomposition beats the oracle at decode — does **not** hold on this 2-node /
+4-NIC-per-node MI300A stack, because the RCCL/OFI flat all-reduce is already
+hierarchical internally. A manual decomposition would be expected to pay off only
+where the vendor collective is *not* topology-aware, or at larger node counts /
+different NIC ratios where the cross-node payload reduction outweighs the extra
+intra-node passes. Capture amortization is real (0.45×→0.73×) but insufficient to
+cross 1.0× here.
 
 ## Environment note (for whoever maintains the EDFs)
 

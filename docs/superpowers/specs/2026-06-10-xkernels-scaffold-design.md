@@ -105,8 +105,12 @@ produce; the FFN example does not need one.
   `dispatch("ffn", ..., backend="auto")`, which resolves in order:
   **explicit arg → env override (`XKERNELS_BACKEND`) → auto** (a per-vendor
   preference order), falling back to `REFERENCE` on CPU or unsupported devices.
-- Public ops are registered as `torch.library` custom ops / wrapped in
-  `autograd.Function` so they compose with autograd and `torch.compile`.
+- Custom kernels are wrapped in `torch.autograd.Function` so the public op is
+  end-to-end differentiable (projection matmuls use `torch.matmul`; the custom
+  kernel handles the fused activation, with a torch-computed backward). The
+  reference backend is pure torch and `torch.compile`-traceable; promoting a
+  custom-kernel backend to a `torch.library.custom_op` for full graph capture is
+  a documented extension point in `docs/adding-a-kernel.md`.
 
 Extending: adding a backend = drop a file + `@register` (no edits to dispatch
 core). Adding a vendor = add an enum value + a detection rule.

@@ -24,6 +24,7 @@ and more later). It serves a dual role:
 | Organization axis | **Kernel-type first**, backend as sub-layer | Matches user mental model ("give me a fused FFN"); keeps cross-vendor Triton kernels DRY; adding a type or a vendor is additive. |
 | Purpose | Library **and** benchmark/test harness | Covers the full lifecycle. |
 | Package name | `xkernels` | Avoids collision with HuggingFace's `kernels` on PyPI. |
+| License | MIT | Permissive; standard for shareable kernel libraries. |
 
 ## Architecture
 

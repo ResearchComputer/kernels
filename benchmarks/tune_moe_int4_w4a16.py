@@ -105,7 +105,12 @@ def tune_shape(tag, E, N, K, top_k, group_size, Ms):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--M", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 512, 4096])
+    ap.add_argument(
+        "--M",
+        type=int,
+        nargs="+",
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 4096],
+    )
     ap.add_argument("--group-size", type=int, default=32)
     args = ap.parse_args()
 

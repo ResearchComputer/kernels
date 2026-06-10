@@ -72,6 +72,40 @@ def _bench(fn, device, iters, warmup):
     return statistics.median(samples)
 
 
+def _bench_graph(run_inplace, device, iters, warmup):
+    """Capture ``run_inplace`` (collectives on static buffers) into a HIP/CUDA
+    graph and time replay — the decode regime, where per-launch overhead is
+    amortized so only data-movement cost remains. Returns ms, or None if capture
+    is unsupported."""
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(5):
+                run_inplace()
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run_inplace()
+    except Exception as exc:
+        if dist.get_rank() == 0:
+            print(f"  [graph capture unsupported: {exc}]", flush=True)
+        return None
+    for _ in range(warmup):
+        g.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+    samples = []
+    for _ in range(iters):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        g.replay()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - t0) * 1e3)
+    return statistics.median(samples)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ranks-per-node", type=int, default=4)
@@ -81,6 +115,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument(
         "--dtype", default=None, help="bf16|float32 (default: bf16 on GPU, float32 CPU)"
+    )
+    ap.add_argument(
+        "--graph", action="store_true", help="also time graph-captured replay (decode regime)"
     )
     args = ap.parse_args()
 
@@ -134,6 +171,35 @@ def main():
                 f"{bs:>4} {flat_ms:>10.4f} {hier_ms:>10.4f} {flat_ms / hier_ms:>7.2f}x",
                 flush=True,
             )
+
+    # ---- graph-captured latency (decode regime: launch overhead amortized) ----
+    if args.graph and use_cuda:
+        rpp = info.ranks_per_node
+        if rank == 0:
+            print("\n[graph-captured]", flush=True)
+            print(f"{'bs':>4} {'flat_ms':>10} {'hier_ms':>10} {'speedup':>8}", flush=True)
+        for bs in args.sizes:
+            n = bs * args.hidden
+            # Static buffers captured by the graph (operated on in place).
+            xb = (torch.randn(n, device=device) * 0.1).to(dtype)
+            rsb = torch.empty(n // rpp, dtype=dtype, device=device)
+            outb = torch.empty(n, dtype=dtype, device=device)
+
+            def _flat(xb=xb):
+                dist.all_reduce(xb, op=dist.ReduceOp.SUM)
+
+            def _hier(xb=xb, rsb=rsb, outb=outb):
+                dist.reduce_scatter_tensor(rsb, xb, op=dist.ReduceOp.SUM, group=intra)
+                dist.all_reduce(rsb, op=dist.ReduceOp.SUM, group=cross)
+                dist.all_gather_into_tensor(outb, rsb, group=intra)
+
+            flat_ms = _bench_graph(_flat, device, args.iters, args.warmup)
+            hier_ms = _bench_graph(_hier, device, args.iters, args.warmup)
+            if rank == 0 and flat_ms and hier_ms:
+                print(
+                    f"{bs:>4} {flat_ms:>10.4f} {hier_ms:>10.4f} {flat_ms / hier_ms:>7.2f}x",
+                    flush=True,
+                )
 
     dist.barrier()
     dist.destroy_process_group()

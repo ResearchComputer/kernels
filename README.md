@@ -1,42 +1,36 @@
-# kernels
+# xkernels
 
-Standalone, tuned + microbenchmarked GPU kernels extracted from the tokenspeed
-serving stack, targeting **AMD MI300A (gfx942, CDNA3)** (portable to NVIDIA where
-practical). Each kernel here corresponds to a tracking issue and ships as a
-self-contained directory with a slow-but-correct PyTorch baseline, the optimized
-kernel, a numerical correctness check against the baseline, and a microbenchmark.
+Customized compute kernels across hardware vendors (NVIDIA, AMD, …) and kernel
+types (FFN, MoE, comm, …), with a uniform PyTorch API, automatic backend
+dispatch, and a correctness + benchmark harness.
 
-## Layout convention
-
-One directory per kernel:
-
-```
-<kernel_name>/
-  README.md            compute-pattern doc + optimization notes + how to run
-  reference.py         slow but correct PyTorch baseline (the numerical oracle)
-  kernel.py            optimized kernel + Python launcher
-  configs.py           autotune config space (for autotuned kernels)
-  test_correctness.py  numerical check vs reference.py
-  benchmark.py         microbenchmark over the relevant production shapes
-```
-
-Backend choice follows tokenspeed's `AGENTS.md`: prefer **Triton Gluon** for AMD
-GPU kernels, **CuteDSL** for NVIDIA, and **portable Triton** for cross-vendor
-solutions. Vendor libraries stay optional.
-
-## Kernels
-
-Tracked by issues #1-#5 (INT4 W4A16 fused-MoE GEMM, dual RMSNorm,
-`mha_merge_state`, `moe_align_block_size`, `moe_sum_reduce`). Each lands as a PR
-adding its own directory.
-
-## Testing without a GPU
-
-Kernels here run under the Triton CPU interpreter for correctness:
+## Install
 
 ```bash
-TRITON_INTERPRET=1 pytest <kernel_name>/test_correctness.py
+pip install -e ".[dev]"          # pure-Python (reference + triton if present)
+XKERNELS_FORCE_BUILD=1 pip install -e .   # also build CUDA/HIP extensions
 ```
 
-Microbenchmarks require a real GPU and must be run on a node you already hold —
-they never submit a cluster job.
+Triton/CUDA backends are optional; the package runs on the pure-torch reference
+path anywhere.
+
+## Usage
+
+```python
+import torch
+from xkernels import fused_ffn
+
+y = fused_ffn(x, w_gate, w_up, w_down)            # backend="auto"
+y = fused_ffn(x, w_gate, w_up, w_down, backend="triton")  # force a backend
+```
+
+Override globally with `XKERNELS_BACKEND=reference|triton|cuda|hip`.
+
+## Layout
+
+- `src/xkernels/ops/<type>/` — kernels by type; each has `reference.py`,
+  `interface.py`, and per-backend subdirs (`triton/`, `cuda/`).
+- `src/xkernels/_dispatch.py` — backend registry + selection.
+- `tests/`, `benchmarks/`, `examples/` — harness and demos.
+
+See `docs/adding-a-kernel.md` to extend. Design: `docs/superpowers/specs/`.

@@ -34,9 +34,19 @@ factor (8) and the group size (32) so unpack and scale-broadcast are clean.
 
 from __future__ import annotations
 
+import json
+import os
+import warnings
+
 import triton
 
-__all__ = ["get_autotune_configs", "prune_configs"]
+__all__ = [
+    "get_autotune_configs",
+    "prune_configs",
+    "align_block_m",
+    "get_moe_int4_config",
+    "load_tuned_config",
+]
 
 
 def _cfg(bm, bn, bk, gm, *, num_warps, num_stages, waves_per_eu, kpack=2, nonkdim=16):
@@ -132,3 +142,103 @@ def prune_configs(configs, named_args, **kwargs):
             continue
         pruned.append(c)
     return pruned or list(configs)
+
+
+# --- tuned-config persistence (issue #16) ----------------------------------
+# Checked-in winners live in tuned_configs/E=..,N=..,K=..,device_name=..,
+# dtype=int4_w4a16.json, mapping a token-batch M-bucket -> launch config. The
+# production launch path resolves one directly (no runtime autotune); untuned
+# shapes fall back to @triton.autotune. Keys starting with "_" are metadata.
+
+_TUNED_CACHE: dict = {}
+_DEVICE_NAME_MEMO: list = []  # one-element memo for the live device name
+
+
+def align_block_m(M: int) -> int:
+    """Token-slot alignment block for ``moe_align_block_size``.
+
+    Must equal the kernel ``BLOCK_SIZE_M``: the grouped GEMM reads one
+    ``expert_ids`` entry per ``BLOCK_SIZE_M``-block, so the sort/pad granularity
+    and the tile M must match or the kernel reads the wrong expert. Small-M
+    decode uses 16; larger M uses 64.
+    """
+    return 16 if M <= 32 else 64
+
+
+def _device_name(arch: str | None = None) -> str | None:
+    """Normalized device string used in tuned-config filenames, or ``None``.
+
+    ``arch`` overrides; then ``$XKERNELS_MOE_ARCH``; then the live CUDA/ROCm
+    device name. Returns ``None`` when no device is visible (CPU / interpreter),
+    which makes ``get_moe_int4_config`` a no-op so the autotune fallback runs.
+    """
+    if arch is not None:
+        return arch.replace(" ", "_")
+    env = os.environ.get("XKERNELS_MOE_ARCH")
+    if env:
+        return env.replace(" ", "_")
+    if _DEVICE_NAME_MEMO:
+        return _DEVICE_NAME_MEMO[0]
+    name = None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0).replace(" ", "_")
+    except Exception:
+        name = None
+    _DEVICE_NAME_MEMO.append(name)
+    return name
+
+
+def _config_dir() -> str:
+    return os.path.join(os.path.dirname(__file__), "tuned_configs")
+
+
+def _config_filename(E: int, N: int, K: int, device: str, dtype: str) -> str:
+    return f"E={E},N={N},K={K},device_name={device},dtype={dtype}.json"
+
+
+def load_tuned_config(E: int, N: int, K: int, device: str, dtype: str = "int4_w4a16"):
+    """Load (and cache) the checked-in tuned-config table for a shape, or ``None``."""
+    key = (E, N, K, device, dtype)
+    if key in _TUNED_CACHE:
+        return _TUNED_CACHE[key]
+    path = os.path.join(_config_dir(), _config_filename(E, N, K, device, dtype))
+    table = None
+    if os.path.exists(path):
+        try:
+            with open(path) as fh:
+                table = json.load(fh)
+        except (OSError, ValueError):
+            warnings.warn(f"could not read tuned MoE config {path!r}", stacklevel=2)
+            table = None
+    _TUNED_CACHE[key] = table
+    return table
+
+
+def _select_config(table: dict, M: int):
+    """Pick the config for the closest tabulated bucket <= M (clamped to range)."""
+    buckets = sorted(int(k) for k in table if not str(k).startswith("_"))
+    if not buckets:
+        return None
+    chosen = buckets[0]
+    for b in buckets:
+        if b <= M:
+            chosen = b
+        else:
+            break
+    return {k: v for k, v in table[str(chosen)].items() if not str(k).startswith("_")}
+
+
+def get_moe_int4_config(
+    E: int, N: int, K: int, M: int, dtype: str = "int4_w4a16", arch: str | None = None
+):
+    """Return the tuned launch config for ``(shape, M)`` on this device, or ``None``."""
+    device = _device_name(arch)
+    if device is None:
+        return None
+    table = load_tuned_config(E, N, K, device, dtype)
+    if not table:
+        return None
+    return _select_config(table, M)

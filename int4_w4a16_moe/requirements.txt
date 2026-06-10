@@ -1,0 +1,5 @@
+# Runtime/test deps for the INT4 W4A16 MoE kernel.
+# torch + triton are expected from the host ROCm/CUDA stack; pinned loosely.
+torch>=2.4
+triton>=3.0
+pytest>=7.0

@@ -26,9 +26,12 @@ solutions. Vendor libraries stay optional.
 
 ## Kernels
 
-Tracked by issues #1-#5 (INT4 W4A16 fused-MoE GEMM, dual RMSNorm,
-`mha_merge_state`, `moe_align_block_size`, `moe_sum_reduce`). Each lands as a PR
-adding its own directory.
+| dir | issue | status |
+|-----|-------|--------|
+| [`int4_w4a16_moe/`](int4_w4a16_moe/) | [#1](../../issues/1) INT4 W4A16 grouped fused-MoE GEMM | Triton, autotuned, correctness-validated (interpreter); on-device tuning pending |
+
+Issues [#2](../../issues/2)-[#5](../../issues/5) (dual RMSNorm, `mha_merge_state`,
+`moe_align_block_size`, `moe_sum_reduce`) are tracked but not yet contributed.
 
 ## Testing without a GPU
 

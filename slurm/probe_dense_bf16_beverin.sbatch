@@ -40,5 +40,9 @@ srun --environment="$ENV_NAME" --cpu-bind=none bash -c '
   TORCH_BLAS_PREFER_HIPBLASLT=0 python -u "$PROBE" --mode no-hipblaslt
 
   echo "######## mode=tunableop ########"
-  PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 python -u "$PROBE" --mode tunableop
+  # Cap per-GEMM tuning so the sweep cannot blow the wall clock; tunableop tunes
+  # every unique GEMM on first sight.
+  PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
+    PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS=30 \
+    python -u "$PROBE" --mode tunableop
 '

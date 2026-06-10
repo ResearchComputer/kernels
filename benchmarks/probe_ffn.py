@@ -12,23 +12,6 @@ import triton
 import triton.language as tl
 
 
-def _ms(fn, iters=20, warmup=5):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    ts = []
-    for _ in range(iters):
-        torch.cuda.synchronize()
-        s.record()
-        fn()
-        e.record()
-        torch.cuda.synchronize()
-        ts.append(s.elapsed_time(e))
-    ts.sort()
-    return ts[len(ts) // 2]
-
-
 def _tflops(ms: float, M: int, K: int, N: int) -> float:
     """GEMM throughput in TFLOP/s (2*M*K*N flops). 0.0 if ms is non-positive."""
     if ms <= 0:
@@ -137,22 +120,33 @@ DECODE_M = [1, 2, 4, 8, 16, 32]
 PREFILL_M = [512, 2048, 4096]
 
 
-def _bench_linear(M, K, N, dtype):
-    """Time F.linear (x[M,K] @ W[N,K]^T) and return (ms, TFLOP/s)."""
+def _bench(fn):
+    """Median ms via Triton ``do_bench`` (adapts the iteration count to a time
+    budget, so a slow fast-path-miss GEMM costs ~2 calls, not a fixed 20)."""
+    return triton.testing.do_bench(fn, warmup=10, rep=30)
+
+
+def _bench_matmul_nn(M, K, N, dtype):
+    """torch.matmul, NN layout (a[M,K] @ b[K,N]) — the original README path."""
+    a = torch.randn(M, K, device="cuda", dtype=dtype)
+    b = torch.randn(K, N, device="cuda", dtype=dtype)
+    return _tflops(_bench(lambda: a @ b), M, K, N)
+
+
+def _bench_linear_nt(M, K, N, dtype):
+    """F.linear, NT layout (x[M,K] @ W[N,K]^T) — the production dense path."""
     import torch.nn.functional as F
 
     x = torch.randn(M, K, device="cuda", dtype=dtype)
     w = torch.randn(N, K, device="cuda", dtype=dtype)
-    ms = _ms(lambda: F.linear(x, w))
-    return ms, _tflops(ms, M, K, N)
+    return _tflops(_bench(lambda: F.linear(x, w)), M, K, N)
 
 
 def _bench_triton(M, K, N):
-    """Time the single-tile Triton bf16 GEMM and return (ms, TFLOP/s)."""
+    """Single-tile Triton tl.dot bf16 GEMM (NN) — the MFMA ceiling reference."""
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    ms = _ms(lambda: _triton_gemm(a, b))
-    return ms, _tflops(ms, M, K, N)
+    return _tflops(_bench(lambda: _triton_gemm(a, b)), M, K, N)
 
 
 def _sanity_check_triton():
@@ -167,24 +161,35 @@ def _sanity_check_triton():
 
 
 def sweep(mode, Ms):
+    """Per (shape, M): bf16 NN matmul, bf16/fp16 NT F.linear, and the Triton bf16
+    ceiling (all TFLOP/s). Flag any torch path that runs below 10% of the Triton
+    bf16 ceiling for the same cell — that is the MFMA/hipBLASLt fast-path miss.
+    """
     state = _apply_blas_mode(mode)
     print(f"\n# ==== mode={mode} ====")
     print(f"# state: {state}")
     print(f"{'shape':14} {'M':>5} {'K':>6} {'N':>6} "
-          f"{'fp16':>8} {'bf16':>8} {'tritbf16':>9} {'bf16/fp16':>10} flag   (TFLOP/s)")
+          f"{'nn_bf16':>8} {'nt_bf16':>8} {'nt_fp16':>8} {'trit_bf16':>9}  flags  (TFLOP/s)")
     for tag, K, N in SHAPES:
         for M in Ms:
             try:
-                _, f16 = _bench_linear(M, K, N, torch.float16)
-                _, b16 = _bench_linear(M, K, N, torch.bfloat16)
-                _, tb16 = _bench_triton(M, K, N)
+                nn_b = _bench_matmul_nn(M, K, N, torch.bfloat16)
+                nt_b = _bench_linear_nt(M, K, N, torch.bfloat16)
+                nt_f = _bench_linear_nt(M, K, N, torch.float16)
+                trit = _bench_triton(M, K, N)
             except Exception as exc:  # OOM / unsupported -> record, keep sweeping
                 print(f"{tag:14} {M:5d} {K:6d} {N:6d}  SKIP: {str(exc)[:48]}")
                 continue
-            ratio = b16 / f16 if f16 > 0 else 0.0
-            flag = "MISS" if ratio < 0.5 else ""
+            ceil = max(trit, 1e-9)
+            flags = []
+            if nn_b < 0.1 * ceil:
+                flags.append("NN_bf16_SLOW")
+            if nt_b < 0.1 * ceil:
+                flags.append("NT_bf16_SLOW")
+            if nt_f < 0.1 * ceil:
+                flags.append("NT_fp16_SLOW")
             print(f"{tag:14} {M:5d} {K:6d} {N:6d} "
-                  f"{f16:8.1f} {b16:8.1f} {tb16:9.1f} {ratio:10.2f} {flag}")
+                  f"{nn_b:8.1f} {nt_b:8.1f} {nt_f:8.1f} {trit:9.1f}  {','.join(flags)}")
 
 
 def main():

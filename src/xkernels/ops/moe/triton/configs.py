@@ -118,20 +118,36 @@ def get_autotune_configs():
 
 
 def prune_configs(configs, named_args, **kwargs):
-    """Drop configs that cannot run for the given problem before benchmarking.
+    """Drop configs that cannot run (or would mis-align) for the given problem.
 
     Removes configs whose ``BLOCK_SIZE_K`` is not a multiple of the quant group
-    size (the scale-broadcast reshape requires ``BLOCK_K % group_k == 0``) and
-    over-large tiles for tiny problems (e.g. ``BLOCK_N > N``). Cuts autotune time
-    and avoids compiling configs that would fail the constexpr asserts.
+    size (the scale-broadcast reshape requires ``BLOCK_K % group_k == 0``) or of
+    the pack factor (8), over-large ``BLOCK_SIZE_N`` for tiny ``N``, and — when
+    the token count is known — configs whose ``BLOCK_SIZE_M`` does not equal
+    ``align_block_m(M)``. The last guard keeps the fallback autotune path
+    consistent with the wrapper's ``moe_align_block_size`` granularity, since the
+    kernel indexes ``expert_ids`` per ``BLOCK_SIZE_M``-block.
     """
-    group_k = named_args.get("group_k", 32)
-    N = named_args.get("N")
-    K = named_args.get("K")
+
+    def g(k, default=None):
+        if k in named_args:
+            return named_args[k]
+        return kwargs.get(k, default)
+
+    group_k = g("group_k", 32)
+    N = g("N")
+    K = g("K")
+    nvt = g("num_valid_tokens")
+    top_k = g("top_k")
+    bm_required = None
+    if nvt is not None and top_k:
+        bm_required = align_block_m(int(nvt) // int(top_k))
+
     pruned = []
     for c in configs:
         bk = c.kwargs["BLOCK_SIZE_K"]
         bn = c.kwargs["BLOCK_SIZE_N"]
+        bm = c.kwargs["BLOCK_SIZE_M"]
         if bk % group_k != 0:
             continue
         if bk % 8 != 0:  # pack factor
@@ -140,8 +156,16 @@ def prune_configs(configs, named_args, **kwargs):
             continue
         if N is not None and bn > 2 * N:  # allow one over-tile for masking
             continue
+        if bm_required is not None and bm != bm_required:
+            continue
         pruned.append(c)
-    return pruned or list(configs)
+    if pruned:
+        return pruned
+    if bm_required is not None:
+        keep = [c for c in configs if c.kwargs["BLOCK_SIZE_M"] == bm_required]
+        if keep:
+            return keep
+    return list(configs)
 
 
 # --- tuned-config persistence (issue #16) ----------------------------------

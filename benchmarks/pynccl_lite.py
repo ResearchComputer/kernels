@@ -60,7 +60,8 @@ def _decl(name, restype, argtypes):
 c_vp = ctypes.c_void_p
 _ncclGetUniqueId = _decl("ncclGetUniqueId", ctypes.c_int, [ctypes.POINTER(NcclUniqueId)])
 _ncclCommInitRank = _decl(
-    "ncclCommInitRank", ctypes.c_int, [ctypes.POINTER(c_vp), ctypes.c_int, NcclUniqueId, ctypes.c_int]
+    "ncclCommInitRank", ctypes.c_int,
+    [ctypes.POINTER(c_vp), ctypes.c_int, NcclUniqueId, ctypes.c_int],
 )
 _ncclCommDestroy = _decl("ncclCommDestroy", ctypes.c_int, [c_vp])
 _ncclAllReduce = _decl(

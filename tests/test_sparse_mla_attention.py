@@ -67,3 +67,48 @@ def test_oracle_matches_independent_naive():
     ref = _naive(q.cpu(), kv.cpu(), indices.cpu(), 0.25, topk_length.cpu(), sink.cpu(), d_v)
     torch.testing.assert_close(out.float().cpu(), ref, atol=1e-5, rtol=1e-5)
     assert lse.shape == (T, H) and maxl.shape == (T, H)
+
+
+from xkernels.ops.attention.interface import (  # noqa: E402
+    flash_mla_sparse_fwd,
+    get_mla_metadata,
+    sparse_mla_attention,
+)
+
+
+def test_native_op_dispatches_to_reference():
+    dev = _dev()
+    torch.manual_seed(1)
+    T, H, D, Kv, topk = 2, 3, 16, 20, 5
+    q = torch.randn(T, H, D, device=dev)
+    kv = torch.randn(Kv, D, device=dev)
+    idx = torch.randint(0, Kv, (T, topk), device=dev, dtype=torch.int32)
+    out, lse, maxl = sparse_mla_attention(q, kv, idx, sm_scale=0.3, backend="reference")
+    eo, el, em = sparse_mla_attention_ref(q, kv, idx, sm_scale=0.3)
+    torch.testing.assert_close(out, eo)
+
+
+def test_flash_mla_sparse_fwd_matches_oracle():
+    """Prefill wrapper: [Kv,1,D] kv + [T,1,topk] indices, returns (out, maxl, lse)."""
+    dev = _dev()
+    torch.manual_seed(2)
+    T, H, D, Kv, topk = 3, 4, 16, 24, 6
+    q = torch.randn(T, H, D, device=dev)
+    kv = torch.randn(Kv, 1, D, device=dev)
+    idx = torch.randint(0, Kv, (T, 1, topk), device=dev, dtype=torch.int32)
+    lens = torch.tensor([topk, topk - 2, topk - 1], device=dev, dtype=torch.int32)
+    sink = torch.randn(H, device=dev)
+    out, maxl, lse = flash_mla_sparse_fwd(
+        q, kv, idx, 0.2, attn_sink=sink, topk_length=lens, backend="reference"
+    )
+    eo, el, em = sparse_mla_attention_ref(
+        q, kv.squeeze(1), idx.squeeze(1), sm_scale=0.2, topk_length=lens, attn_sink=sink
+    )
+    torch.testing.assert_close(out, eo)
+    torch.testing.assert_close(lse, el)
+
+
+def test_get_mla_metadata_is_callable_noarg():
+    meta, num_splits = get_mla_metadata()
+    assert isinstance(num_splits, int) and num_splits >= 1
+    assert isinstance(meta, torch.Tensor)

@@ -12,6 +12,7 @@ from ..._dispatch import dispatch
 from . import (
     dsa_reference,  # noqa: F401  (registers dsa_indexer_logits REFERENCE)
     reference,  # noqa: F401  (registers REFERENCE backend)
+    sparse_mla_reference,  # noqa: F401  (registers sparse_mla_attention REFERENCE)
 )
 from .dsa_reference import dsa_indexer_topk  # noqa: F401  (re-export thin helper)
 
@@ -77,3 +78,84 @@ def mha_merge_state(
         ``(out [T, H, D] in out_a.dtype, lse [T, H] fp32)``.
     """
     return dispatch("mha_merge_state", out_a, lse_a, out_b, lse_b, backend=backend)
+
+
+def sparse_mla_attention(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    sm_scale: float,
+    topk_length: torch.Tensor | None = None,
+    attn_sink: torch.Tensor | None = None,
+    d_v: int | None = None,
+    backend: Backend | str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """DeepSeek-V4 sparse-MLA attention compute (issue #32): flash softmax over
+    the DSA-indexer-selected latent KV. Portable gfx942 replacement for the
+    NVIDIA-only ``flash_mla`` sparse/decode kernels.
+
+    Args:
+        q: ``[T, H, D]`` latent queries (D = kv_lora_rank + rope; V4: 512).
+        kv: ``[Kv, D]`` shared latent MQA cache.
+        indices: ``[T, topk]`` int32 columns into ``kv`` (``<0`` = padding).
+        sm_scale: softmax scale on the q.k score.
+        topk_length: optional ``[T]`` int — valid column count per query.
+        attn_sink: optional ``[H]`` (or scalar) per-head sink logit.
+        d_v: value/output dim (first ``d_v`` latent dims). Defaults to ``D``.
+        backend: ``"auto"`` or a ``Backend`` / its string value.
+
+    Returns:
+        ``(out [T, H, d_v], lse [T, H] fp32, max_logits [T, H] fp32)``.
+    """
+    return dispatch(
+        "sparse_mla_attention",
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        d_v=d_v,
+        backend=backend,
+    )
+
+
+def flash_mla_sparse_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    attn_sink: torch.Tensor | None = None,
+    topk_length: torch.Tensor | None = None,
+    *,
+    d_v: int | None = None,
+    backend: Backend | str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prefill sparse-MLA (upstream-faithful name). ``kv`` is the bf16 latent
+    workspace ``[Kv, 1, D]`` and ``indices`` is ``[T, 1, topk]`` (the ``1`` is the
+    MQA KV head). Returns ``(out, max_logits, lse)`` in upstream order.
+    """
+    kv2 = kv.squeeze(1) if kv.dim() == 3 else kv
+    idx2 = indices.squeeze(1) if indices.dim() == 3 else indices
+    out, lse, maxl = sparse_mla_attention(
+        q,
+        kv2,
+        idx2,
+        sm_scale=sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        d_v=d_v,
+        backend=backend,
+    )
+    return out, maxl, lse
+
+
+def get_mla_metadata(*args, **kwargs) -> tuple[torch.Tensor, int]:
+    """Scheduling metadata (upstream-faithful name). V4 calls this no-arg and
+    threads ``[0]`` into the decode kernel as an opaque ``tile_scheduler_metadata``
+    that this compute path ignores. Returns ``(placeholder int32 tensor,
+    num_splits=1)`` — no split-KV scheduling (a future split path would reuse
+    ``mha_merge_state`` #3).
+    """
+    return torch.empty(0, dtype=torch.int32), 1

@@ -25,6 +25,7 @@ def fused_moe_int4_w4a16(
     *,
     group_size: int = 32,
     mul_routed_weight: bool = True,
+    fused_combine: bool = False,
     backend: Backend | str = "auto",
 ) -> torch.Tensor:
     """INT4 W4A16 grouped fused-MoE GEMM ``out[m] = sum_j w[m,j] * (A[m] @ W[e]^T)``.
@@ -37,6 +38,8 @@ def fused_moe_int4_w4a16(
         topk_w: ``[M, top_k]`` fp32 routing weights.
         group_size: quant group size along K (default 32).
         mul_routed_weight: fold routing weights into the output (down GEMM).
+        fused_combine: fuse the weighted top-k combine into the GEMM epilogue
+            (Triton backend) — returns ``[M, N]`` directly with no separate reduce.
         backend: ``"auto"`` or a ``Backend`` / its string value.
 
     Returns:
@@ -51,5 +54,6 @@ def fused_moe_int4_w4a16(
         topk_w,
         group_size=group_size,
         mul_routed_weight=mul_routed_weight,
+        fused_combine=fused_combine,
         backend=backend,
     )

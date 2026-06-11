@@ -107,6 +107,7 @@ def _fused_moe_int4_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     FILTER_EXPERT: tl.constexpr,
+    COMBINE: tl.constexpr = False,
     # AMD/CDNA3 lowering knobs. Declared as (unused) constexpr so the same
     # autotune ``Config.kwargs`` work on both stock Triton (which forwards
     # Config kwargs as kernel args -> accepted here, ignored in codegen) and the
@@ -148,13 +149,15 @@ def _fused_moe_int4_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if FILTER_EXPERT and off_experts == -1:
-        # Filtered (EP) block: write zeros and exit. At EP=8 most blocks for a
-        # given rank are *not* filtered, but routed tokens whose expert lives on
-        # another rank still produce a -1 block that must zero its output slot.
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type), mask=c_mask)
+        # Filtered (EP) block. In the default path write zeros to the token-indexed
+        # slot; in COMBINE mode the [M, N] buffer is pre-zeroed, so just exit.
+        if not COMBINE:
+            offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+            tl.store(
+                c_ptrs, tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type), mask=c_mask
+            )
         return
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
@@ -242,9 +245,17 @@ def _fused_moe_int4_kernel(
 
     accumulator = accumulator.to(compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if COMBINE:
+        # Fused weighted top-k combine: atomic-accumulate each expert's result into
+        # the token's row (offs_token // top_k) of the [M, N] fp32 output. Padding
+        # slots are masked out, so they never touch a valid row.
+        out_rows = offs_token // top_k
+        c_ptrs = c_ptr + stride_cm * out_rows[:, None] + stride_cn * offs_cn[None, :]
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+    else:
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 # Autotuned entry point (unchanged name): used for untuned shapes and by the
@@ -279,6 +290,7 @@ def int4_w4a16_moe_gemm(
     compute_type: tl.dtype = tl.bfloat16,
     filter_expert: bool = True,
     config: dict | None = None,
+    combine: bool = False,
 ) -> torch.Tensor:
     """Launch the grouped INT4 W4A16 fused-MoE GEMM.
 
@@ -321,6 +333,8 @@ def int4_w4a16_moe_gemm(
     K = kp * 8
     assert K % group_size == 0
     assert b_scale.shape == (E, N, K // group_size)
+    if combine:
+        assert c.dtype == torch.float32, "combine mode requires an fp32 output buffer"
 
     num_valid_tokens = topk_weights.numel() if topk_weights is not None else a.shape[0] * top_k
 
@@ -354,6 +368,7 @@ def int4_w4a16_moe_gemm(
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         compute_type=compute_type,
         FILTER_EXPERT=filter_expert,
+        COMBINE=combine,
     )
 
     if config is not None:
@@ -400,6 +415,7 @@ def _moe_int4_w4a16_triton(
     topk_w: torch.Tensor,
     group_size: int = 32,
     mul_routed_weight: bool = True,
+    fused_combine: bool = False,
 ) -> torch.Tensor:
     M, top_k = topk_ids.shape
     E, N, kp = packed.shape
@@ -410,6 +426,29 @@ def _moe_int4_w4a16_triton(
     config = get_moe_int4_config(E, N, K, M)
     block_m = config["BLOCK_SIZE_M"] if config is not None else align_block_m(M)
     sorted_ids, expert_ids, num_post = moe_align_block_size_ref(topk_ids, block_m, E)
+    if fused_combine:
+        # Fused weighted top-k combine: the kernel atomic-accumulates into a single
+        # [M, N] fp32 buffer, so there is no [M*top_k, N] scratch and no separate
+        # moe_sum_reduce. fp32 accumulate -> cast to the activation dtype.
+        out = torch.zeros((M, N), dtype=torch.float32, device=A.device)
+        int4_w4a16_moe_gemm(
+            A,
+            packed,
+            scale,
+            out,
+            topk_w.reshape(-1).float(),
+            sorted_ids,
+            expert_ids,
+            num_post,
+            top_k=top_k,
+            group_size=group_size,
+            mul_routed_weight=mul_routed_weight,
+            compute_type=tl.float32,
+            filter_expert=False,
+            config=config,
+            combine=True,
+        )
+        return out.to(A.dtype)
     c = torch.zeros((M * top_k, N), dtype=A.dtype, device=A.device)
     compute_type = tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float32
     int4_w4a16_moe_gemm(

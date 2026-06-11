@@ -11,6 +11,7 @@ class Backend(enum.Enum):
     TRITON = "triton"
     CUDA = "cuda"
     HIP = "hip"
+    TILELANG = "tilelang"
 
 
 def detect_vendor() -> str:

@@ -35,6 +35,13 @@ try:  # pragma: no cover - requires triton
 except Exception:
     pass
 
+# Optional TileLang backend (gfx942): self-registers only where a from-source
+# TileLang ROCm build is importable (a serving image); no-op elsewhere.
+try:  # pragma: no cover - requires a from-source tilelang ROCm build
+    from .tilelang import sparse_mla_kernel as _tl_sparse_mla_kernel  # noqa: F401
+except Exception:
+    pass
+
 __all__ = [
     "mha_merge_state",
     "dsa_indexer_logits",

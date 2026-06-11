@@ -16,6 +16,10 @@ from ._backends import Backend, detect_vendor
 _REGISTRY: dict[str, dict[Backend, Callable]] = {}
 
 # Per-vendor preference order for "auto" selection (first available wins).
+# TILELANG is opt-in (explicit ``backend="tilelang"``), not in "auto": the current
+# TileLang sparse-MLA backend covers only the unmasked (full-top-k) case, so
+# "auto" must not route padded/variable-length calls to it. Promote it into the
+# AMD auto order once the kernel gains the per-token length mask (Phase 2).
 _AUTO_ORDER: dict[str, list[Backend]] = {
     "nvidia": [Backend.CUDA, Backend.TRITON, Backend.REFERENCE],
     "amd": [Backend.HIP, Backend.TRITON, Backend.REFERENCE],

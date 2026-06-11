@@ -200,3 +200,91 @@ def test_fp8_ds_mla_small_dims():
     value, scale, ref = make_fp8_ds_mla_kv(1, nope_dim=64, rope_dim=64, device=dev, seed=0)
     got = dequant_fp8_ds_mla(value, scale, nope_dim=64, rope_dim=64)
     torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-6)
+
+
+def _paged_cache(num_blocks, block_size, seed):
+    """Build a paged fp8_ds_mla (value, scale) cache + its full bf16 latent."""
+    rows = num_blocks * block_size
+    value, scale, ref = make_fp8_ds_mla_kv(rows, device=_dev(), seed=seed)
+    vb, sb = value.shape[-1], scale.shape[-1]
+    return (
+        value.view(num_blocks, block_size, vb),
+        scale.view(num_blocks, block_size, sb),
+        ref.view(num_blocks, block_size, -1),
+    )
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch lacks float8_e4m3fn")
+def test_flash_mla_with_kvcache_dual_cache():
+    from xkernels.ops.attention.interface import flash_mla_with_kvcache
+
+    dev = _dev()
+    torch.manual_seed(5)
+    nb, bs, H, D = 4, 8, 4, 512
+    backend = Backend.TRITON if _HAS_TRITON else Backend.REFERENCE
+    val, sca, ref = _paged_cache(nb, bs, seed=5)
+    vale, scae, refe = _paged_cache(nb, bs, seed=6)
+    rows = nb * bs
+    T, topk = 3, 5
+    dt = torch.float32 if _INTERP else torch.bfloat16
+    q = torch.randn(T, H, D, device=dev, dtype=dt)
+    blk = torch.arange(nb, device=dev, dtype=torch.int32).view(1, nb).expand(T, nb).contiguous()
+    idx = torch.randint(0, rows, (T, topk), device=dev, dtype=torch.int32)
+    eidx = torch.randint(0, rows, (T, topk), device=dev, dtype=torch.int32)
+    lens = torch.full((T,), topk, device=dev, dtype=torch.int32)
+    elens = torch.full((T,), topk, device=dev, dtype=torch.int32)
+    sink = torch.randn(H, device=dev)
+
+    out, lse = flash_mla_with_kvcache(
+        q=q.unsqueeze(1), k_cache=val, block_table=blk, cache_seqlens=None,
+        head_dim_v=D, tile_scheduler_metadata=None, softmax_scale=0.1,
+        is_fp8_kvcache=True, indices=idx.unsqueeze(1), attn_sink=sink,
+        extra_k_cache=vale, extra_indices_in_kvcache=eidx,
+        topk_length=lens, extra_topk_length=elens,
+        scale_cache=sca, extra_scale_cache=scae, block_size=bs, backend=backend,
+    )
+    out = out.squeeze(1) if out.dim() == 4 else out
+
+    # Oracle: concat the two dequantized gathered sets per token, run the ref.
+    flat = ref.reshape(rows, D)
+    eflat = refe.reshape(rows, D)
+    kv_cat = torch.cat([flat, eflat], dim=0)  # [2*rows, D]
+    idx_cat = torch.cat([idx, eidx + rows], dim=1)  # [T, 2*topk]
+    len_cat = lens + elens
+    eo, el, _ = sparse_mla_attention_ref(
+        q.to(torch.float32), kv_cat, idx_cat, sm_scale=0.1,
+        topk_length=len_cat, attn_sink=sink, d_v=D,
+    )
+    atol = 1e-3 if _INTERP else 3e-2
+    torch.testing.assert_close(out.float(), eo.float(), atol=atol, rtol=atol)
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch lacks float8_e4m3fn")
+def test_flash_mla_with_kvcache_single_cache():
+    """Degenerate single-cache decode (no extra compressed cache)."""
+    from xkernels.ops.attention.interface import flash_mla_with_kvcache
+
+    dev = _dev()
+    torch.manual_seed(8)
+    nb, bs, H, D = 3, 8, 4, 512
+    backend = Backend.TRITON if _HAS_TRITON else Backend.REFERENCE
+    val, sca, ref = _paged_cache(nb, bs, seed=8)
+    rows = nb * bs
+    T, topk = 2, 6
+    dt = torch.float32 if _INTERP else torch.bfloat16
+    q = torch.randn(T, H, D, device=dev, dtype=dt)
+    blk = torch.arange(nb, device=dev, dtype=torch.int32).view(1, nb).expand(T, nb).contiguous()
+    idx = torch.randint(0, rows, (T, topk), device=dev, dtype=torch.int32)
+    idx[0, -2:] = -1  # padding sentinels
+    out, lse = flash_mla_with_kvcache(
+        q=q.unsqueeze(1), k_cache=val, block_table=blk, cache_seqlens=None,
+        head_dim_v=D, tile_scheduler_metadata=None, softmax_scale=0.1,
+        is_fp8_kvcache=True, indices=idx.unsqueeze(1),
+        scale_cache=sca, block_size=bs, backend=backend,
+    )
+    out = out.squeeze(1)
+    eo, _, _ = sparse_mla_attention_ref(
+        q.to(torch.float32), ref.reshape(rows, D), idx, sm_scale=0.1, d_v=D
+    )
+    atol = 1e-3 if _INTERP else 3e-2
+    torch.testing.assert_close(out.float(), eo.float(), atol=atol, rtol=atol)

@@ -15,6 +15,7 @@ from . import (
     sparse_mla_reference,  # noqa: F401  (registers sparse_mla_attention REFERENCE)
 )
 from .dsa_reference import dsa_indexer_topk  # noqa: F401  (re-export thin helper)
+from .sparse_mla_decode import flash_mla_with_kvcache  # noqa: F401  (re-export decode)
 
 
 def dsa_indexer_logits(

@@ -37,6 +37,7 @@ def moe_align_block_size(
     num_experts: int,
     *,
     backend: Backend | str = "auto",
+    truncate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort/pad routed token-slots into per-expert blocks.
 
@@ -45,10 +46,16 @@ def moe_align_block_size(
         block_size: GEMM block size each expert run is padded up to.
         num_experts: number of experts.
         backend: ``"auto"`` or a ``Backend`` / its string value.
+        truncate: if True (default) trim ``expert_ids`` to used blocks (eager); if
+            False return the full ``max_blocks`` length with no host sync, for
+            HIP/CUDA-graph capture (Triton backend).
 
     Returns:
         ``(sorted_token_ids [max_pad], expert_ids [max_blocks], num_tokens_post_padded [1])``
         where ``max_pad = M*top_k + (num_experts+1)*(block_size-1)`` and unused
         slots hold ``pad_id = M*top_k``.
     """
-    return dispatch("moe_align_block_size", topk_ids, block_size, num_experts, backend=backend)
+    return dispatch(
+        "moe_align_block_size", topk_ids, block_size, num_experts,
+        backend=backend, truncate=truncate,
+    )

@@ -123,6 +123,10 @@ def _align_expert_ids(
     valid = (e >= 1) & (e <= num_experts)
     cs = tl.load(cumsum_ptr + e, mask=valid, other=_I32_MAX)
     expert = tl.sum(((cs <= off) & valid).to(tl.int32), axis=0)
+    # Unused trailing blocks (off >= total padded) count all experts -> num_experts,
+    # one past the valid 0-based range. Map to sentinel 0 (matches the tokenspeed
+    # contract); used blocks are always < num_experts so they are untouched.
+    expert = tl.where(expert >= num_experts, 0, expert)
     tl.store(expert_ids_ptr + b, expert)
 
 
@@ -153,6 +157,7 @@ def moe_align_block_size_triton(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    truncate: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort/pad routed token-slots into per-expert blocks (issue #4, Triton).
 
@@ -168,6 +173,10 @@ def moe_align_block_size_triton(
         num_tokens_post_padded [1])`` where ``max_pad = M*top_k +
         (num_experts+1)*(block_size-1)``, ``n = num_tokens_post_padded`` and
         unused ``sorted_token_ids`` slots hold ``pad_id = M*top_k``.
+
+        With ``truncate=False`` (graph-capturable), ``expert_ids`` is the full
+        ``max_blocks = cdiv(max_pad, block_size)`` length with unused trailing
+        blocks set to 0 and no device->host sync.
     """
     flat = topk_ids.reshape(-1).contiguous()
     numel = flat.numel()
@@ -200,9 +209,13 @@ def moe_align_block_size_triton(
         flat, sorted_ids, tokens_cnts, cumsum, num_experts, numel, tokens_per_thread
     )
 
-    # Reference returns expert_ids truncated to the blocks actually used.
-    n = int(num_post.item())
-    return sorted_ids, expert_ids[: n // block_size], num_post
+    if truncate:
+        # Eager mode: device->host sync to trim expert_ids to the used blocks.
+        n = int(num_post.item())
+        return sorted_ids, expert_ids[: n // block_size], num_post
+    # Sync-free / fixed-shape mode (graph-capturable): no .item(); expert_ids is
+    # the full max_blocks length with unused trailing blocks = 0.
+    return sorted_ids, expert_ids, num_post
 
 
 register("moe_align_block_size", Backend.TRITON)(moe_align_block_size_triton)

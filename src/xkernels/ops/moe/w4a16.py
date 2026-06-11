@@ -41,10 +41,16 @@ def dequant_w4a16(
     return w.view(E, N, K).to(torch.bfloat16)
 
 
-def moe_align_block_size_ref(topk_ids: torch.Tensor, block_size: int, num_experts: int):
+def moe_align_block_size_ref(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int, truncate: bool = True
+):
     """Sort/pad routed token-slots into per-expert blocks (issue #4 baseline).
 
     Reused so the optimized kernel and the reference consume identical dispatch.
+
+    With ``truncate=True`` (default) ``expert_ids`` is trimmed to the used blocks;
+    with ``truncate=False`` it is the full ``max_blocks`` length, unused trailing
+    blocks set to sentinel 0 (fixed-shape, for graph capture / issue #18).
 
     Returns ``(sorted_token_ids, expert_ids, num_tokens_post_padded)``.
     """
@@ -72,6 +78,12 @@ def moe_align_block_size_ref(topk_ids: torch.Tensor, block_size: int, num_expert
         off += n
     if not expert_ids:
         expert_ids = [0]
+    if not truncate:
+        # Fixed-shape mode: pad to the full block count with sentinel 0 so the
+        # output is graph-shaped. Unused blocks are past num_tokens_post_padded
+        # and are never read by the GEMM consumer.
+        max_blocks = (max_pad + block_size - 1) // block_size
+        expert_ids = expert_ids + [0] * (max_blocks - len(expert_ids))
     return (
         sorted_ids,
         torch.tensor(expert_ids, dtype=torch.int32, device=topk_ids.device),

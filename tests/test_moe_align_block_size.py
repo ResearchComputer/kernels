@@ -118,6 +118,25 @@ def test_triton_single_expert_all_tokens():
         torch.testing.assert_close(g, r, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "M,top_k,num_experts,block_size",
+    [(8, 2, 4, 4), (16, 8, 48, 16), (1, 8, 48, 16), (7, 3, 5, 4)],
+)
+def test_reference_truncate_false_fixed_shape(M, top_k, num_experts, block_size):
+    topk_ids = _make_topk_ids(M, top_k, num_experts)
+    s_t, e_t, n_t = moe_align_block_size_ref(topk_ids, block_size, num_experts)  # truncate=True
+    s_f, e_f, n_f = moe_align_block_size_ref(topk_ids, block_size, num_experts, truncate=False)
+    total = M * top_k
+    max_pad = total + (num_experts + 1) * (block_size - 1)
+    max_blocks = (max_pad + block_size - 1) // block_size
+    used = int(n_f.item()) // block_size
+    assert e_f.numel() == max_blocks                       # fixed shape
+    torch.testing.assert_close(s_f, s_t, rtol=0, atol=0)   # sorted_ids unchanged
+    torch.testing.assert_close(n_f, n_t, rtol=0, atol=0)   # num_post unchanged
+    torch.testing.assert_close(e_f[:used], e_t, rtol=0, atol=0)  # used prefix matches
+    assert torch.all(e_f[used:] == 0)                      # tail sentinel
+
+
 @pytest.mark.parametrize("seed", range(8))
 def test_triton_matches_reference_randomized(seed):
     # Random shapes/routings exercise the per-expert offset + padding index math

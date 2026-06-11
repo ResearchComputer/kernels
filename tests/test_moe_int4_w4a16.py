@@ -162,6 +162,27 @@ def test_tuned_config_path_matches_reference(monkeypatch):
     torch.testing.assert_close(got.float(), ref.float(), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("mul_routed", [False, True])
+def test_fused_combine_matches_reference(mul_routed):
+    """fused_combine=True (atomic top-k combine in the epilogue) == GEMM+reduce."""
+    if not _HAS_TRITON:
+        pytest.skip("triton backend not registered (triton not installed)")
+    dev = _device()
+    group_size = 32
+    _pin_single_config()
+    M, E, N, K, top_k = 8, 8, 256, 512, 4
+    packed, scale, A, topk_ids, topk_w = _inputs(M, E, N, K, top_k, dev, group_size)
+    got = fused_moe_int4_w4a16(
+        A, packed, scale, topk_ids, topk_w,
+        group_size=group_size, mul_routed_weight=mul_routed,
+        backend=Backend.TRITON, fused_combine=True,
+    )
+    ref = _ref_grouped(A, packed, scale, topk_ids, topk_w, group_size, mul_routed)
+    assert got.shape == (M, N)  # [M, N], no [M*top_k, N] intermediate exposed
+    atol = rtol = 3e-3 if _INTERP else 2e-2
+    torch.testing.assert_close(got.float(), ref.float(), atol=atol, rtol=rtol)
+
+
 if __name__ == "__main__":
     import sys
 

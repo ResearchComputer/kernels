@@ -27,6 +27,7 @@ def moe_w4a16_ref(
     topk_w: torch.Tensor,
     group_size: int = 32,
     mul_routed_weight: bool = True,
+    fused_combine: bool = False,
 ) -> torch.Tensor:
     """Reference grouped MoE GEMM: ``out[m] = sum_j w[m,j] * (A[m] @ W[e]^T)``.
 
@@ -38,6 +39,9 @@ def moe_w4a16_ref(
         topk_w: ``[M, top_k]`` fp32 routing weights.
         group_size: quant group size.
         mul_routed_weight: fold routing weights into the sum (matches down GEMM).
+        fused_combine: accepted for API parity with the Triton backend; the
+            reference already returns the combined ``[M, N]`` result, so it is a
+            no-op here.
 
     Returns:
         ``[M, N]`` output in ``A.dtype`` (fp32 accumulation).

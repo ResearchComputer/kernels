@@ -19,7 +19,11 @@ try:  # pragma: no cover - requires triton
     from ..._triton_compat import triton_import_ctx
 
     with triton_import_ctx():
-        from .triton import dsa_indexer_kernel, merge_state_kernel  # noqa: F401
+        from .triton import (  # noqa: F401
+            dsa_indexer_kernel,
+            merge_state_kernel,
+            sparse_mla_kernel,
+        )
 except Exception:
     pass
 

@@ -112,3 +112,64 @@ def test_get_mla_metadata_is_callable_noarg():
     meta, num_splits = get_mla_metadata()
     assert isinstance(num_splits, int) and num_splits >= 1
     assert isinstance(meta, torch.Tensor)
+
+
+from xkernels._backends import Backend  # noqa: E402
+from xkernels._dispatch import registered_backends  # noqa: E402
+
+_HAS_TRITON = Backend.TRITON in registered_backends("sparse_mla_attention")
+
+
+@pytest.mark.parametrize(
+    "D,d_v,topk,H", [(512, 512, 64, 8), (512, 448, 128, 4), (32, 32, 7, 3)]
+)
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_triton_matches_reference(D, d_v, topk, H, with_sink):
+    if not _HAS_TRITON:
+        pytest.skip("triton backend not registered")
+    dev = _dev()
+    torch.manual_seed(3)
+    dt = torch.float32 if _INTERP else torch.bfloat16
+    T, Kv = 5, max(64, topk + 8)
+    q = torch.randn(T, H, D, device=dev, dtype=dt)
+    kv = torch.randn(Kv, D, device=dev, dtype=dt)
+    idx = torch.randint(0, Kv, (T, topk), device=dev, dtype=torch.int32)
+    idx[0, -3:] = -1
+    lens = torch.randint(1, topk + 1, (T,), device=dev, dtype=torch.int32)
+    sink = torch.randn(H, device=dev) if with_sink else None
+    got = sparse_mla_attention(
+        q, kv, idx, sm_scale=0.1, topk_length=lens, attn_sink=sink,
+        d_v=d_v, backend=Backend.TRITON,
+    )
+    exp = sparse_mla_attention(
+        q, kv, idx, sm_scale=0.1, topk_length=lens, attn_sink=sink,
+        d_v=d_v, backend=Backend.REFERENCE,
+    )
+    atol = rtol = 1e-4 if _INTERP else 2e-2
+    torch.testing.assert_close(got[0].float(), exp[0].float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(got[1], exp[1], atol=atol, rtol=rtol)
+
+
+def test_triton_empty_window_row_no_nan():
+    """A token with zero selected KV (topk_length=0) must not NaN; with a sink it
+    attends to the sink only (out=0), without a sink it is a zero row."""
+    if not _HAS_TRITON:
+        pytest.skip("triton backend not registered")
+    dev = _dev()
+    torch.manual_seed(7)
+    dt = torch.float32 if _INTERP else torch.bfloat16
+    T, H, D, Kv, topk = 2, 4, 32, 16, 96  # topk > BLOCK_N=64 -> multi-chunk
+    q = torch.randn(T, H, D, device=dev, dtype=dt)
+    kv = torch.randn(Kv, D, device=dev, dtype=dt)
+    idx = torch.randint(0, Kv, (T, topk), device=dev, dtype=torch.int32)
+    lens = torch.tensor([0, topk], device=dev, dtype=torch.int32)  # row 0 empty
+    for sink in (None, torch.randn(H, device=dev)):
+        got = sparse_mla_attention(
+            q, kv, idx, sm_scale=0.1, topk_length=lens, attn_sink=sink,
+            backend=Backend.TRITON,
+        )
+        assert torch.isfinite(got[0]).all(), "NaN/Inf in output"
+        torch.testing.assert_close(
+            got[0][0].float(), torch.zeros_like(got[0][0]).float(),
+            atol=1e-4, rtol=1e-4,
+        )

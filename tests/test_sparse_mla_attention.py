@@ -173,3 +173,30 @@ def test_triton_empty_window_row_no_nan():
             got[0][0].float(), torch.zeros_like(got[0][0]).float(),
             atol=1e-4, rtol=1e-4,
         )
+
+
+from xkernels.ops.attention.sparse_mla import (  # noqa: E402
+    dequant_fp8_ds_mla,
+    make_fp8_ds_mla_kv,
+)
+
+_HAS_FP8 = hasattr(torch, "float8_e4m3fn")
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch lacks float8_e4m3fn")
+def test_fp8_ds_mla_roundtrip():
+    dev = _dev()
+    rows = 7
+    value, scale, ref = make_fp8_ds_mla_kv(rows, device=dev, seed=4)
+    got = dequant_fp8_ds_mla(value, scale)
+    assert got.shape == (rows, 512)
+    torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch lacks float8_e4m3fn")
+def test_fp8_ds_mla_small_dims():
+    """A small case (one nope group) exercises the same encode/decode inverse."""
+    dev = _dev()
+    value, scale, ref = make_fp8_ds_mla_kv(1, nope_dim=64, rope_dim=64, device=dev, seed=0)
+    got = dequant_fp8_ds_mla(value, scale, nope_dim=64, rope_dim=64)
+    torch.testing.assert_close(got, ref, atol=1e-6, rtol=1e-6)

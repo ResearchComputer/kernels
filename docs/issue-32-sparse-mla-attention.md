@@ -83,10 +83,14 @@ index + the dequant helper; the *compute* — the missing piece — is Triton).
   empty-window, single- and dual-cache decode, fp8_ds_mla round-trip.
 - On-device (gfx942 / MI300A): `slurm/test_sparse_mla_beverin.sbatch`.
 
+On-device run (beverin, AMD Instinct MI300A / gfx942, torch 2.11.0+rocm7.2, real
+Triton compile — job 382459):
+
 | Check | Shape | Result |
 |-------|-------|--------|
-| prefill Triton vs oracle max\|err\| | H=128, D=512, d_v=448, topk=512 | _(filled from beverin run)_ |
-| decode dual-cache parity | — | _(filled from beverin run)_ |
+| `pytest tests/test_sparse_mla_attention.py` (bf16) | — | **16 passed** |
+| prefill Triton vs oracle | H=128, D=512, d_v=448, topk=512 | **max\|err\|=1.95e-03, rel=9.3e-04** |
+| decode dual-cache + single-cache parity | nb×bs paged fp8_ds_mla | **passed** (in the pytest set) |
 
 > `d_v` default is the full latent `D`; pin to 448 against tokenspeed's o_proj
 > during on-device bring-up if a real V4 layer disagrees.

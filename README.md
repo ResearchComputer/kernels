@@ -47,12 +47,15 @@ or `sbatch slurm/bench_all_beverin.sbatch`.
 | `dual_rmsnorm` | T=8192, d=(1536,512) | 0.25 ms (2× sequential RMSNorm) | 0.05 ms | **5.0×** |
 | `mha_merge_state` | T=8192, H=128, D=128 | 2.57 ms (torch merge) | 0.80 ms | **3.2×** |
 | `fused_ffn` | M=4096, 4096→11008 (fp16) | 5.56 ms (unfused torch) | 5.49 ms | **1.0×** |
+| `mhc_prenorm_gemm` | T=8, K=16384, N=24, splits=16 | 2.65 ms (F.linear+sqsum) | 0.02 ms | **119×** |
 
 Naive baselines: `moe_int4_w4a16` (tuned grouped GEMM, block-align excluded —
 see its own row) vs per-expert dequant(int4→bf16)+matmul; `moe_sum_reduce` /
 `mha_merge_state` vs their torch oracles; `dual_rmsnorm` vs two sequential
 RMSNorm launches; `moe_align_block_size` vs the torch argsort + per-expert
-padding reference; `fused_ffn` vs the unfused `reference` backend.
+padding reference; `fused_ffn` vs the unfused `reference` backend;
+`mhc_prenorm_gemm` vs `F.linear(a.float(), fn.float())` + a separate per-row
+sum-of-squares.
 
 Notes:
 
@@ -74,6 +77,16 @@ Notes:
   2.11+rocm7.2 build the **bf16** GEMM misses the MFMA/hipBLASLt path and runs
   ~470× slower than fp16 (0.8 vs 358 TFLOP/s; see `benchmarks/probe_ffn.py`) —
   a stack issue, not a kernel one.
+- **`mhc_prenorm_gemm` ~119×** — the DeepSeek-V4 MHC hidden-compression prenorm
+  GEMM (issue #36), a portable gfx942 replacement for NVIDIA-only
+  `deep_gemm.tf32_hc_prenorm_gemm`. A memory-bound tall-skinny GEMM (K=16384,
+  N=24) fused with the RMS-prenorm squared-sum, split along K for decode
+  occupancy. The optimized time (~0.02 ms) is flat across T=1/8/64
+  (launch/bandwidth-bound). The win is large partly because the kernel reads `A`
+  once and fuses both outputs, and partly because the naive
+  `F.linear(a.float(), fn.float())` fp32 baseline pays the same dense-GEMM stack
+  cliff as `fused_ffn` above. On-device parity rel 3.8e-04; see
+  `docs/issue-36-mhc-prenorm-gemm.md`.
 - **`moe_align_block_size` 32.9×** — the Triton perf backend (vLLM/SGLang-style
   4-stage histogram + padded prefix-sum + scatter, issue #4) is validated
   bit-for-bit against the reference. The win is large because the reference pays

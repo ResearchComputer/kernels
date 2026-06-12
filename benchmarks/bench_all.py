@@ -91,6 +91,29 @@ def bench_sparse_mla(dev):
     )
 
 
+def bench_mhc_prenorm(dev):
+    import torch.nn.functional as F
+
+    from xkernels import hc_prenorm_gemm
+    from xkernels._backends import Backend
+
+    T, hc_mult, hidden = 8, 4, 4096
+    K, N, n_splits = hc_mult * hidden, 24, 16
+    a = torch.randn(T, K, device=dev, dtype=DT)
+    fn = torch.randn(N, K, device=dev, dtype=torch.float32)
+
+    def naive():
+        af = a.float()
+        return F.linear(af, fn.float()), (af * af).sum(-1)
+
+    _record(
+        "mhc_prenorm_gemm", f"T={T}, K={K}, N={N}, splits={n_splits}",
+        "F.linear+sqsum",
+        naive,
+        lambda: hc_prenorm_gemm(a, fn, n_splits=n_splits, backend=Backend.TRITON),
+    )
+
+
 def bench_dual_rmsnorm(dev):
     T, D1, D2 = 8192, 1536, 512
     x1 = torch.randn(T, D1, device=dev, dtype=DT)
@@ -222,6 +245,7 @@ def main():
     for fn in (
         bench_merge_state,
         bench_sparse_mla,
+        bench_mhc_prenorm,
         bench_dual_rmsnorm,
         bench_moe_sum_reduce,
         bench_moe_align,

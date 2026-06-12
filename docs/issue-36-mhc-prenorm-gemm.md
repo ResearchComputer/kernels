@@ -106,13 +106,25 @@ Offline tests live in `tests/test_mhc_prenorm_gemm.py` and cover:
 - **Faithful wrapper:** `tf32_hc_prenorm_gemm` is called with the same inputs and
   compared to `hc_prenorm_gemm`; must match exactly (it is a thin re-export).
 
-On-device run (beverin, AMD Instinct MI300A / gfx942):
+On-device run (beverin, AMD Instinct MI300A / gfx942, torch 2.11.0+rocm7.2,
+hip 7.2.26015, real Triton compile via the `tokenspeed_triton` AMD backend —
+job 383345):
 
 | Check | Shape | Result |
 |-------|-------|--------|
-| `pytest tests/test_mhc_prenorm_gemm.py` | — | *(filled by beverin run — issue #36 Task 6)* |
-| sum invariant (bf16→fp32) | T=8, K=16384, N=24, splits=16 | *(filled by beverin run — issue #36 Task 6)* |
-| benchmark vs F.linear+sqsum | T=1/8/64, K=16384, N=24 | *(filled by beverin run — issue #36 Task 6)* |
+| `pytest tests/test_mhc_prenorm_gemm.py` | — | **15 passed** (29.0 s) |
+| sum invariant (bf16 A → fp32) | T=8, K=16384, N=24, splits=16 | **mul max\|err\|=1.53e-01, rel=3.77e-04; sqrsum max\|err\|=1.95e-03** |
+| benchmark vs `F.linear`+sqsum | T=1/8/64, K=16384, N=24, splits=16 | **0.022 ms** vs 2.66 ms → **~120×** |
 
-> On-device numbers are placeholders pending the Task 6 beverin run. No performance
-> figures are reported here until measured on real hardware.
+The `mul` absolute error (1.5e-1) is large only because the GEMM accumulates
+K=16384 terms (output magnitudes ~O(√K)); the **relative** error 3.77e-04 is the
+expected fp32-accumulation-order difference between a single `F.linear` and the
+split-K Triton sum — on par with the sparse-MLA bring-up (#33, rel 9.3e-04).
+
+The ~120× speedup reflects both the kernel's efficiency (memory-bound, reads A
+once, fuses the squared-sum into the same load) **and** that the naive
+`F.linear(a.float(), fn.float())` fp32 baseline hits the slow dense-GEMM path on
+this torch 2.11+rocm7.2 stack (the cliff characterized in #17) — a practitioner
+writing the replacement in plain torch would indeed pay that cost. The Triton
+time is flat across T=1/8/64 (launch/bandwidth-bound at this tiny N=24), and the
+split-K parallelization keeps even the T=1 decode case occupied.
